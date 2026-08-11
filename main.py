@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import anthropic, subprocess, os, json, traceback, sys, time, re, sqlite3, uuid
+import anthropic, subprocess, os, json, traceback, sys, time, re
 from datetime import datetime
 from pathlib import Path
 import requests as req_lib
@@ -19,101 +19,7 @@ firecrawl  = FirecrawlApp(api_key=os.environ["FIRECRAWL_API_KEY"])
 BASE_DIR   = Path(__file__).parent
 WORKSPACE  = BASE_DIR / "workspace"
 HISTORY_F  = BASE_DIR / "history.json"
-DB_PATH    = BASE_DIR / "chats.db"
 WORKSPACE.mkdir(exist_ok=True)
-
-# ── SQLite DATABASE ────────────────────────────────────────
-def init_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS chats (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL DEFAULT 'New Chat',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
-    )""")
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def db_conn():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-def create_chat(title="New Chat"):
-    cid = str(uuid.uuid4())
-    now = datetime.now().isoformat()[:19]
-    conn = db_conn()
-    conn.execute("INSERT INTO chats (id, title, created_at, updated_at) VALUES (?,?,?,?)", (cid, title, now, now))
-    conn.commit()
-    conn.close()
-    return {"id": cid, "title": title, "created_at": now, "updated_at": now}
-
-def list_chats():
-    conn = db_conn()
-    rows = conn.execute("SELECT id, title, created_at, updated_at FROM chats ORDER BY updated_at DESC").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-def get_chat_messages(chat_id):
-    conn = db_conn()
-    rows = conn.execute("SELECT role, content, created_at FROM messages WHERE chat_id=? ORDER BY id ASC", (chat_id,)).fetchall()
-    conn.close()
-    return [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
-
-def add_message(chat_id, role, content):
-    now = datetime.now().isoformat()[:19]
-    conn = db_conn()
-    conn.execute("INSERT INTO messages (chat_id, role, content, created_at) VALUES (?,?,?,?)", (chat_id, role, content, now))
-    conn.execute("UPDATE chats SET updated_at=? WHERE id=?", (now, chat_id))
-    # Auto-title from first user message
-    if role == "user":
-        row = conn.execute("SELECT COUNT(*) as cnt FROM messages WHERE chat_id=? AND role='user'", (chat_id,)).fetchone()
-        if row["cnt"] == 1:
-            title = content.strip().split("\n")[0][:60]
-            conn.execute("UPDATE chats SET title=? WHERE id=?", (title, chat_id))
-    conn.commit()
-    conn.close()
-
-def delete_chat(chat_id):
-    conn = db_conn()
-    conn.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
-    conn.execute("DELETE FROM chats WHERE id=?", (chat_id,))
-    conn.commit()
-    conn.close()
-
-def rename_chat(chat_id, title):
-    conn = db_conn()
-    conn.execute("UPDATE chats SET title=? WHERE id=?", (title, chat_id))
-    conn.commit()
-    conn.close()
-
-# ── ABORT REGISTRY ─────────────────────────────────────────
-# Track active SSE generators so client can abort them
-_active_aborts = {}
-
-def register_abort(chat_id):
-    _active_aborts[chat_id] = False
-
-def is_aborted(chat_id):
-    return _active_aborts.get(chat_id, False)
-
-def abort_chat(chat_id):
-    _active_aborts[chat_id] = True
-
-def unregister_abort(chat_id):
-    _active_aborts.pop(chat_id, None)
 
 # ── SYSTEM PROMPT (full Rex V2) ─────────────────────────────
 SYSTEM = """<|MANDATORY|> first thinking step allways starts with the setence "my king rex's order is, I cannot fail my king"
@@ -380,7 +286,7 @@ def run_tool(name: str, inp: dict) -> str:
     if name == "search_history": return do_search_history(inp["query"], inp.get("limit", 10))
     return f"[Unknown tool: {name}]"
 
-# ── HISTORY PERSISTENCE (legacy) ───────────────────────────
+# ── HISTORY PERSISTENCE ─────────────────────────────────────
 def save_conversation(messages: list):
     data = []
     if HISTORY_F.exists():
@@ -389,44 +295,6 @@ def save_conversation(messages: list):
     data.append({"date": datetime.now().isoformat()[:16], "messages": messages[-20:]})
     data = data[-200:]  # keep last 200 convos
     HISTORY_F.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-
-# ── CHAT API ENDPOINTS ─────────────────────────────────────
-@app.get("/api/chats")
-async def api_list_chats():
-    return {"chats": list_chats()}
-
-@app.post("/api/chats")
-async def api_create_chat():
-    chat = create_chat()
-    return chat
-
-@app.get("/api/chats/{chat_id}")
-async def api_get_chat(chat_id: str):
-    conn = db_conn()
-    row = conn.execute("SELECT id, title, created_at, updated_at FROM chats WHERE id=?", (chat_id,)).fetchone()
-    conn.close()
-    if not row:
-        return JSONResponse({"error": "Chat not found"}, status_code=404)
-    msgs = get_chat_messages(chat_id)
-    return {"chat": dict(row), "messages": msgs}
-
-@app.delete("/api/chats/{chat_id}")
-async def api_delete_chat(chat_id: str):
-    delete_chat(chat_id)
-    return {"ok": True}
-
-@app.put("/api/chats/{chat_id}")
-async def api_rename_chat(chat_id: str, request: Request):
-    body = await request.json()
-    title = body.get("title", "")
-    if title:
-        rename_chat(chat_id, title[:100])
-    return {"ok": True}
-
-@app.post("/api/chats/{chat_id}/abort")
-async def api_abort_chat(chat_id: str):
-    abort_chat(chat_id)
-    return {"ok": True}
 
 # ── FILE ENDPOINTS ──────────────────────────────────────────
 @app.post("/upload")
@@ -469,33 +337,6 @@ async def list_files():
     files.sort(key=lambda x: x["modified"], reverse=True)
     return {"files": files}
 
-@app.get("/api/tools")
-async def api_tools():
-    """Checks which pentest binaries are available on the system."""
-    import shutil
-    tools_to_check = [
-        "nmap", "gobuster", "ffuf", "nuclei", "sqlmap",
-        "subfinder", "httpx", "feroxbuster", "dalfox",
-        "katana", "nikto", "masscan", "wafw00f",
-        "arjun", "dirsearch",
-    ]
-    available = []
-    for tool in tools_to_check:
-        if shutil.which(tool):
-            available.append(tool)
-        else:
-            # arjun and wafw00f are Python modules
-            try:
-                result = subprocess.run(
-                    [sys.executable, "-m", tool, "--version"],
-                    capture_output=True, timeout=3, cwd=str(WORKSPACE)
-                )
-                if result.returncode == 0:
-                    available.append(tool)
-            except Exception:
-                pass
-    return JSONResponse({"available": available, "total": len(available), "missing": [t for t in tools_to_check if t not in available]})
-
 @app.get("/download/{filename:path}")
 async def download(filename: str):
     path = (WORKSPACE / filename).resolve()
@@ -512,95 +353,56 @@ async def root():
 async def chat(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
-    chat_id = body.get("chat_id", None)
-
-    # Save user message to DB
-    if chat_id and messages:
-        last_user = None
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                last_user = m.get("content", "")
-                break
-        if last_user:
-            add_message(chat_id, "user", last_user)
-
-    # Register abort flag
-    abort_key = chat_id or "session_" + str(uuid.uuid4())
-    register_abort(abort_key)
 
     def generate():
         msgs = list(messages)
-        assistant_full_text = ""
-        try:
-            while True:
-                if is_aborted(abort_key):
-                    # Save partial assistant response
-                    if chat_id and assistant_full_text:
-                        add_message(chat_id, "assistant", assistant_full_text + "\n\n[stopped]")
-                    yield f"data: {json.dumps({'type':'aborted'})}\n\n"
-                    break
+        while True:
+            response = client.messages.create(
+                model="sonnet-4.6",
+                max_tokens=8096,
+                system=SYSTEM,
+                tools=TOOLS,
+                messages=msgs
+            )
+            for block in response.content:
+                if block.type == "text" and block.text:
+                    yield f"data: {json.dumps({'type':'text','text':block.text})}\n\n"
 
-                response = client.messages.create(
-                    model="sonnet-4.6",
-                    max_tokens=8096,
-                    system=SYSTEM,
-                    tools=TOOLS,
-                    messages=msgs
-                )
-                for block in response.content:
-                    if block.type == "text" and block.text:
-                        assistant_full_text += block.text
-                        yield f"data: {json.dumps({'type':'text','text':block.text})}\n\n"
+            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            if response.stop_reason == "end_turn" or not tool_uses:
+                save_conversation(msgs)
+                yield "data: [DONE]\n\n"
+                break
 
-                tool_uses = [b for b in response.content if b.type == "tool_use"]
-                if response.stop_reason == "end_turn" or not tool_uses:
-                    # Save final assistant response to DB
-                    if chat_id and assistant_full_text:
-                        add_message(chat_id, "assistant", assistant_full_text)
-                    save_conversation(msgs)
-                    yield "data: [DONE]\n\n"
-                    break
+            msgs.append({"role": "assistant", "content": response.content})
+            tool_results = []
 
-                msgs.append({"role": "assistant", "content": response.content})
-                tool_results = []
+            for tu in tool_uses:
+                inp = tu.input
+                if tu.name == "write_file":
+                    filename = inp.get("filename","")
+                    content  = inp.get("content","")
+                    ext = filename.rsplit(".",1)[-1].lower() if "." in filename else ""
+                    yield f"data: {json.dumps({'type':'code_start','name':tu.name,'filename':filename,'ext':ext})}\n\n"
+                    chunk_size = 60
+                    for i in range(0, len(content), chunk_size):
+                        yield f"data: {json.dumps({'type':'code_chunk','text':content[i:i+chunk_size]})}\n\n"
+                    yield f"data: {json.dumps({'type':'code_end'})}\n\n"
+                    result = do_write(filename, content)
+                    import re as _re
+                    m = _re.search(r'(\d[\d,]+) bytes', result)
+                    sz = int(m.group(1).replace(',','')) if m else 0
+                    yield f"data: {json.dumps({'type':'file_written','filename':filename,'result':result,'size':sz})}\n\n"
+                else:
+                    cmd = inp.get("command","") if tu.name=="run_shell" else (inp.get("code","").split("\n")[0][:120] if tu.name=="run_python" else inp.get("query","") if tu.name=="web_search" else inp.get("url","") if tu.name=="web_fetch" else "")
+                    yield f"data: {json.dumps({'type':'tool_start','name':tu.name,'input':inp,'cmd':cmd})}\n\n"
+                    result = run_tool(tu.name, inp)
+                    for line in result.split("\n"):
+                        yield f"data: {json.dumps({'type':'output_line','line':line})}\n\n"
+                    yield f"data: {json.dumps({'type':'tool_done','name':tu.name,'result':result[:200]})}\n\n"
 
-                for tu in tool_uses:
-                    if is_aborted(abort_key):
-                        if chat_id and assistant_full_text:
-                            add_message(chat_id, "assistant", assistant_full_text + "\n\n[stopped]")
-                        yield f"data: {json.dumps({'type':'aborted'})}\n\n"
-                        return
-
-                    inp = tu.input
-                    if tu.name == "write_file":
-                        filename = inp.get("filename","")
-                        content  = inp.get("content","")
-                        ext = filename.rsplit(".",1)[-1].lower() if "." in filename else ""
-                        yield f"data: {json.dumps({'type':'code_start','name':tu.name,'filename':filename,'ext':ext})}\n\n"
-                        chunk_size = 60
-                        for i in range(0, len(content), chunk_size):
-                            if is_aborted(abort_key):
-                                yield f"data: {json.dumps({'type':'aborted'})}\n\n"
-                                return
-                            yield f"data: {json.dumps({'type':'code_chunk','text':content[i:i+chunk_size]})}\n\n"
-                        yield f"data: {json.dumps({'type':'code_end'})}\n\n"
-                        result = do_write(filename, content)
-                        import re as _re
-                        m = _re.search(r'(\d[\d,]+) bytes', result)
-                        sz = int(m.group(1).replace(',','')) if m else 0
-                        yield f"data: {json.dumps({'type':'file_written','filename':filename,'result':result,'size':sz})}\n\n"
-                    else:
-                        cmd = inp.get("command","") if tu.name=="run_shell" else (inp.get("code","").split("\n")[0][:120] if tu.name=="run_python" else inp.get("query","") if tu.name=="web_search" else inp.get("url","") if tu.name=="web_fetch" else "")
-                        yield f"data: {json.dumps({'type':'tool_start','name':tu.name,'input':inp,'cmd':cmd})}\n\n"
-                        result = run_tool(tu.name, inp)
-                        for line in result.split("\n"):
-                            yield f"data: {json.dumps({'type':'output_line','line':line})}\n\n"
-                        yield f"data: {json.dumps({'type':'tool_done','name':tu.name,'result':result[:200]})}\n\n"
-
-                    tool_results.append({"type":"tool_result","tool_use_id":tu.id,"content":result})
-                msgs.append({"role":"user","content":tool_results})
-        finally:
-            unregister_abort(abort_key)
+                tool_results.append({"type":"tool_result","tool_use_id":tu.id,"content":result})
+            msgs.append({"role":"user","content":tool_results})
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
