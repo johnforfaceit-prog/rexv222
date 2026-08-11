@@ -3,7 +3,7 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y \
     curl wget git nmap netcat-openbsd unzip \
     gcc build-essential libssl-dev libpcap-dev \
-    nikto masscan perl \
+    perl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -60,3 +60,4 @@ COPY . .
 RUN mkdir -p workspace
 EXPOSE 8000
 CMD ["python", "main.py"]
+
