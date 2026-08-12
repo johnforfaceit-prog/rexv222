@@ -301,14 +301,6 @@ def save_conversation(messages: list):
     HISTORY_F.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 # ── FILE ENDPOINTS ──────────────────────────────────────────
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """Upload a file — save to workspace and return its text content for AI analysis"""
-    content_bytes = await file.read()
-    safe_name = file.filename.replace("..", "").replace("/", "_")
-    path = WORKSPACE / safe_name
-    path.write_bytes(content_bytes)
-
     # Try decode as text
     try:
         text = content_bytes.decode("utf-8")
