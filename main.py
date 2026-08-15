@@ -392,20 +392,20 @@ async def chat(request: Request):
                     import re as _re
                     m = _re.search(r'(\d[\d,]+) bytes', result)
                     sz = int(m.group(1).replace(',','')) if m else 0
-                    yield f"data: {json.dumps({'type':'file_written','filename':filename,'result':result,'size':sz})}\n\n"
+                    yield f"data: {json.dumps({'type':'tool_result','tool_name':tu.name,'text':f'✓ Written {sz:,} bytes'})}\n\n"
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
                 else:
-                    cmd = inp.get("command","") if tu.name=="run_shell" else (inp.get("code","").split("\n")[0][:120] if tu.name=="run_python" else inp.get("query","") if tu.name=="web_search" else inp.get("url","") if tu.name=="web_fetch" else "")
-                    yield f"data: {json.dumps({'type':'tool_start','name':tu.name,'input':inp,'cmd':cmd})}\n\n"
+                    yield f"data: {json.dumps({'type':'tool_start','tool_name':tu.name})}\n\n"
                     result = run_tool(tu.name, inp)
-                    for line in result.split("\n"):
-                        yield f"data: {json.dumps({'type':'output_line','line':line})}\n\n"
-                    yield f"data: {json.dumps({'type':'tool_done','name':tu.name,'result':result[:200]})}\n\n"
+                    yield f"data: {json.dumps({'type':'tool_result','tool_name':tu.name,'text':result})}\n\n"
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
 
-                tool_results.append({"type":"tool_result","tool_use_id":tu.id,"content":result})
-            msgs.append({"role":"user","content":tool_results})
+            if tool_results:
+                msgs.append({"role": "user", "content": tool_results})
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
