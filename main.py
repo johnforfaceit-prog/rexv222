@@ -1,10 +1,9 @@
-from fastapi import FastAPI, Request, UploadFile, File, Form
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import anthropic, subprocess, os, json, traceback, sys, time, re
+import anthropic, subprocess, os, json, traceback, sys, re
 from datetime import datetime
 from pathlib import Path
-import requests as req_lib
 from exa_py import Exa
 from firecrawl import FirecrawlApp
 
@@ -78,87 +77,65 @@ ALWAYS use tools to EXECUTE, not just explain. Write code → run it → show ou
 Формат (СТРОГО):
 > **📌 [Описание]** — [зачем это нужно, что ищем, что проверяем]
 
-Примеры:
-> **📌 Устанавливаю gobuster** — скачиваю бинарь для брутфорса директорий на целевом сайте
-> **📌 Сканирую скрытые пути** — ищу /admin, /api, .env и другие чувствительные endpoints
-> **📌 Пишу Python скрипт** — тестирую IDOR уязвимость перебором user_id без авторизации
-> **📌 Запускаю nuclei** — прогоняю 13000+ шаблонов на HIGH/CRITICAL уязвимости
-> **📌 Читаю результаты** — смотрю что нашёл сканер, ищем критические уязвимости
+client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+exa = Exa(api_key=os.environ["EXA_API_KEY"])
+firecrawl = FirecrawlApp(api_key=os.environ["FIRECRAWL_API_KEY"])
 
 НИКОГДА не запускай инструмент без этого описания. Рекс должен понимать что происходит в реальном времени."""
 
-# ── TOOLS ──────────────────────────────────────────────────
 TOOLS = [
     {
         "name": "run_shell",
-        "description": "Execute bash. For: pip/apt/go install, wget/curl downloads, gobuster/ffuf/nuclei/sqlmap/nmap, git, any system command.",
+        "description": "Execute bash commands",
         "input_schema": {"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","default":120}},"required":["command"]}
     },
     {
         "name": "run_python",
-        "description": "Execute Python code. Returns stdout. Use for scripting, analysis, API calls, data processing.",
+        "description": "Execute Python code",
         "input_schema": {"type":"object","properties":{"code":{"type":"string"},"timeout":{"type":"integer","default":60}},"required":["code"]}
     },
     {
         "name": "write_file",
-        "description": "Write content to workspace file. Always run the file after writing it.",
+        "description": "Write file to workspace",
         "input_schema": {"type":"object","properties":{"filename":{"type":"string"},"content":{"type":"string"}},"required":["filename","content"]}
     },
     {
         "name": "read_file",
-        "description": "Read a workspace file.",
+        "description": "Read workspace file",
         "input_schema": {"type":"object","properties":{"filename":{"type":"string"},"max_lines":{"type":"integer","default":200}},"required":["filename"]}
     },
     {
         "name": "list_workspace",
-        "description": "List all workspace files with sizes and download links.",
+        "description": "List workspace files",
         "input_schema": {"type":"object","properties":{}}
     },
     {
         "name": "web_search",
-        "description": "Search the internet using Exa (neural search). Returns titles, URLs, snippets and publication dates. Use for researching targets, CVEs, exploits, tools, documentation, anything current.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query":       {"type": "string", "description": "Search query"},
-                "num_results": {"type": "integer", "default": 8, "description": "Number of results (max 20)"},
-                "include_text":{"type": "boolean", "default": False, "description": "Include full page text in results"}
-            },
-            "required": ["query"]
-        }
+        "description": "Search with Exa",
+        "input_schema": {"type":"object","properties":{"query":{"type":"string"},"num_results":{"type":"integer","default":8}},"required":["query"]}
     },
     {
         "name": "web_fetch",
-        "description": "Fetch and parse a URL using Firecrawl. Returns clean markdown content. Handles JS-rendered pages, SPAs, anti-bot protection. Use for reading any webpage, source code, CVE pages, docs.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url":      {"type": "string", "description": "URL to fetch"},
-                "formats":  {"type": "array",  "default": ["markdown"], "description": "Output formats: markdown, html, screenshot, links"}
-            },
-            "required": ["url"]
-        }
+        "description": "Fetch URL content",
+        "input_schema": {"type":"object","properties":{"url":{"type":"string"},"formats":{"type":"array","default":["markdown"]}},"required":["url"]}
     },
     {
         "name": "search_history",
-        "description": "Search past conversation history by keyword. Returns matching messages with context.",
+        "description": "Search conversation history",
         "input_schema": {"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","default":10}},"required":["query"]}
     }
 ]
 
-# ── TOOL EXECUTORS ──────────────────────────────────────────
 def exec_shell(command: str, timeout: int = 120) -> str:
     timeout = min(int(timeout), 300)
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout, cwd=str(WORKSPACE),
-            env={**os.environ, "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/go/bin:/root/go/bin"}
-        )
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout, cwd=str(WORKSPACE))
         out = (result.stdout + result.stderr).strip()
-        if len(out) > 8000: out = out[:4000]+"\n...[TRUNCATED]...\n"+out[-3000:]
-        return out or "(no output)"
-    except subprocess.TimeoutExpired: return f"[TIMEOUT after {timeout}s]"
-    except Exception as e: return f"[ERROR] {e}"
+        return out[:8000] if len(out) > 8000 else (out or "(no output)")
+    except subprocess.TimeoutExpired:
+        return f"[TIMEOUT after {timeout}s]"
+    except Exception as e:
+        return f"[ERROR] {e}"
 
 def exec_python(code: str, timeout: int = 60) -> str:
     timeout = min(int(timeout), 120)
@@ -167,20 +144,22 @@ def exec_python(code: str, timeout: int = 60) -> str:
         script.write_text(code)
         result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=timeout, cwd=str(WORKSPACE))
         out = (result.stdout + result.stderr).strip()
-        if len(out) > 8000: out = out[:4000]+"\n...[TRUNCATED]...\n"+out[-3000:]
-        return out or "(no output)"
-    except subprocess.TimeoutExpired: return f"[TIMEOUT after {timeout}s]"
-    except Exception as e: return f"[ERROR] {traceback.format_exc()}"
+        return out[:8000] if len(out) > 8000 else (out or "(no output)")
+    except subprocess.TimeoutExpired:
+        return f"[TIMEOUT after {timeout}s]"
+    except Exception as e:
+        return f"[ERROR] {traceback.format_exc()}"
 
 def do_write(filename: str, content: str) -> str:
     path = WORKSPACE / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    return f"✓ Written {path.stat().st_size:,} bytes → workspace/{filename}"
+    return f"✓ Written {path.stat().st_size:,} bytes → {filename}"
 
 def do_read(filename: str, max_lines: int = 200) -> str:
     path = WORKSPACE / filename
-    if not path.exists(): return f"[Not found: {filename}]"
+    if not path.exists():
+        return f"[Not found: {filename}]"
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     if len(lines) > max_lines:
         return "\n".join(lines[:max_lines]) + f"\n...[{len(lines)-max_lines} more lines]"
@@ -189,165 +168,116 @@ def do_read(filename: str, max_lines: int = 200) -> str:
 def do_list() -> str:
     rows = []
     for fp in sorted(WORKSPACE.rglob("*")):
-        if fp.is_file() and not fp.name.startswith("_") and not fp.name.startswith("."):
+        if fp.is_file() and not fp.name.startswith("_"):
             rel = fp.relative_to(WORKSPACE)
-            rows.append(f"  {rel}  ({fp.stat().st_size:,}b)  → /download/{rel}")
-    return "\n".join(rows) if rows else "(workspace empty)"
+            rows.append(f"{rel} ({fp.stat().st_size:,}b)")
+    return "\n".join(rows) if rows else "(empty)"
 
-def do_web_search(query: str, num_results: int = 8, include_text: bool = False) -> str:
+def do_web_search(query: str, num_results: int = 8) -> str:
     try:
-        num_results = min(int(num_results), 20)
-        if include_text:
-            results = exa.search_and_contents(
-                query,
-                num_results=num_results,
-                use_autoprompt=True,
-                text={"max_characters": 1000}
-            )
-        else:
-            results = exa.search(query, num_results=num_results, use_autoprompt=True)
-
+        results = exa.search(query, num_results=min(int(num_results), 20), use_autoprompt=True)
         if not results.results:
             return "No results found."
-
         out = []
         for i, r in enumerate(results.results, 1):
-            entry = f"[{i}] {r.title or '(no title)'}\n    URL: {r.url}\n    Published: {r.published_date or 'unknown'}"
-            if include_text and hasattr(r, 'text') and r.text:
-                entry += f"\n    {r.text[:800]}"
-            out.append(entry)
+            out.append(f"[{i}] {r.title}\n    {r.url}\n    {r.published_date or 'unknown'}")
         return "\n\n".join(out)
     except Exception as e:
-        return f"[Exa search error] {e}"
+        return f"[Exa error] {e}"
 
 def do_web_fetch(url: str, formats: list = None) -> str:
     try:
-        if formats is None:
-            formats = ["markdown"]
-        result = firecrawl.scrape_url(url, formats=formats)
-
-        # Extract markdown content
+        result = firecrawl.scrape_url(url, formats=formats or ["markdown"])
         content = ""
-        if hasattr(result, 'markdown') and result.markdown:
+        if hasattr(result, 'markdown'):
             content = result.markdown
         elif isinstance(result, dict):
-            content = result.get("markdown") or result.get("content") or str(result)
-
-        if not content:
-            return f"[Firecrawl] No content returned for {url}"
-
-        # Truncate if too long
+            content = result.get("markdown", "") or result.get("content", "")
         if len(content) > 12000:
-            content = content[:12000] + f"\n\n...[truncated {len(content)-12000} chars]"
-
-        meta = ""
-        if isinstance(result, dict) and result.get("metadata"):
-            m = result["metadata"]
-            meta = f"Title: {m.get('title','')}\nDescription: {m.get('description','')}\n\n"
-        elif hasattr(result, 'metadata') and result.metadata:
-            m = result.metadata
-            meta = f"Title: {getattr(m,'title','')}\n\n"
-
-        return f"URL: {url}\n{meta}{content}"
+            content = content[:12000] + f"\n\n...[truncated]"
+        return content or "[No content]"
     except Exception as e:
         return f"[Firecrawl error] {e}"
 
 def do_search_history(query: str, limit: int = 10) -> str:
-    if not HISTORY_F.exists(): return "No history yet."
+    if not HISTORY_F.exists():
+        return "No history"
     try:
         data = json.loads(HISTORY_F.read_text())
-        query_lower = query.lower()
         matches = []
         for conv in data:
             for msg in conv.get("messages", []):
-                content = msg.get("content", "")
-                if isinstance(content, str) and query_lower in content.lower():
-                    matches.append({
-                        "date": conv.get("date",""),
-                        "role": msg.get("role",""),
-                        "preview": content[:300]
-                    })
-        if not matches: return f"No history found for: {query}"
-        out = [f"Found {len(matches)} matches for '{query}':\n"]
-        for m in matches[:limit]:
-            out.append(f"[{m['date']}] {m['role'].upper()}: {m['preview']}\n---")
-        return "\n".join(out)
-    except Exception as e:
-        return f"[History error] {e}"
+                if query.lower() in str(msg.get("content", "")).lower():
+                    matches.append(msg.get("content", "")[:300])
+        return "\n---\n".join(matches[:limit]) if matches else "No matches"
+    except:
+        return "Error reading history"
 
 def run_tool(name: str, inp: dict) -> str:
-    if name == "run_shell":      return exec_shell(inp["command"], inp.get("timeout", 120))
-    if name == "run_python":     return exec_python(inp["code"], inp.get("timeout", 60))
-    if name == "write_file":     return do_write(inp["filename"], inp["content"])
-    if name == "read_file":      return do_read(inp["filename"], inp.get("max_lines", 200))
-    if name == "list_workspace": return do_list()
-    if name == "web_search":     return do_web_search(inp["query"], inp.get("num_results", 8), inp.get("include_text", False))
-    if name == "web_fetch":      return do_web_fetch(inp["url"], inp.get("formats", ["markdown"]))
-    if name == "search_history": return do_search_history(inp["query"], inp.get("limit", 10))
+    if name == "run_shell":
+        return exec_shell(inp["command"], inp.get("timeout", 120))
+    elif name == "run_python":
+        return exec_python(inp["code"], inp.get("timeout", 60))
+    elif name == "write_file":
+        return do_write(inp["filename"], inp["content"])
+    elif name == "read_file":
+        return do_read(inp["filename"], inp.get("max_lines", 200))
+    elif name == "list_workspace":
+        return do_list()
+    elif name == "web_search":
+        return do_web_search(inp["query"], inp.get("num_results", 8))
+    elif name == "web_fetch":
+        return do_web_fetch(inp["url"], inp.get("formats", ["markdown"]))
+    elif name == "search_history":
+        return do_search_history(inp["query"], inp.get("limit", 10))
     return f"[Unknown tool: {name}]"
 
-# ── HISTORY PERSISTENCE ─────────────────────────────────────
 def save_conversation(messages: list):
     data = []
     if HISTORY_F.exists():
-        try: data = json.loads(HISTORY_F.read_text())
-        except: data = []
+        try:
+            data = json.loads(HISTORY_F.read_text())
+        except:
+            data = []
     data.append({"date": datetime.now().isoformat()[:16], "messages": messages[-20:]})
-    data = data[-200:]  # keep last 200 convos
+    data = data[-200:]
     HISTORY_F.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
-# ── FILE ENDPOINTS ──────────────────────────────────────────
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """Upload a file — save to workspace and return its text content for AI analysis"""
     content_bytes = await file.read()
     safe_name = file.filename.replace("..", "").replace("/", "_")
     path = WORKSPACE / safe_name
     path.write_bytes(content_bytes)
-
-    # Try decode as text
     try:
         text = content_bytes.decode("utf-8")
-        is_binary = False
-    except Exception:
-        try:
-            text = content_bytes.decode("latin-1")
-            is_binary = False
-        except Exception:
-            text = f"[Binary file — {len(content_bytes):,} bytes]"
-            is_binary = True
-
-    ext = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
-    return JSONResponse({
-        "filename": safe_name,
-        "size": len(content_bytes),
-        "ext": ext,
-        "is_binary": is_binary,
-        "text": text[:20000],          # send up to 20k chars to AI
-        "preview": text[:500],          # short preview for UI
-    })
+    except:
+        text = f"[Binary: {len(content_bytes):,} bytes]"
+    return JSONResponse({"filename": safe_name, "size": len(content_bytes), "text": text[:20000]})
 
 @app.get("/api/files")
 async def list_files():
     files = []
     for fp in sorted(WORKSPACE.rglob("*")):
-        if fp.is_file() and not fp.name.startswith("_") and not fp.name.startswith("."):
-            rel = str(fp.relative_to(WORKSPACE))
-            files.append({"name": rel, "size": fp.stat().st_size, "modified": fp.stat().st_mtime})
-    files.sort(key=lambda x: x["modified"], reverse=True)
+        if fp.is_file() and not fp.name.startswith("_"):
+            files.append({"name": str(fp.relative_to(WORKSPACE)), "size": fp.stat().st_size})
     return {"files": files}
 
 @app.get("/download/{filename:path}")
 async def download(filename: str):
     path = (WORKSPACE / filename).resolve()
-    if not str(path).startswith(str(WORKSPACE)): return {"error": "Invalid path"}
-    if not path.exists(): return {"error": "Not found"}
+    if not str(path).startswith(str(WORKSPACE)):
+        return {"error": "Invalid path"}
+    if not path.exists():
+        return {"error": "Not found"}
     return FileResponse(str(path), filename=path.name)
 
-# ── MAIN CHAT ───────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return (BASE_DIR / "index.html").read_text()
+    html_path = BASE_DIR / "index.html"
+    if html_path.exists():
+        return html_path.read_text()
+    return "<h1>Rex AI</h1><p>Upload index.html to get started</p>"
 
 @app.post("/chat")
 async def chat(request: Request):
@@ -364,6 +294,7 @@ async def chat(request: Request):
                 tools=TOOLS,
                 messages=msgs
             )
+            
             for block in response.content:
                 if block.type == "text" and block.text:
                     yield f"data: {json.dumps({'type':'text','text':block.text})}\n\n"
@@ -378,27 +309,9 @@ async def chat(request: Request):
             tool_results = []
 
             for tu in tool_uses:
-                inp = tu.input
-                if tu.name == "write_file":
-                    filename = inp.get("filename","")
-                    content  = inp.get("content","")
-                    ext = filename.rsplit(".",1)[-1].lower() if "." in filename else ""
-                    yield f"data: {json.dumps({'type':'code_start','name':tu.name,'filename':filename,'ext':ext})}\n\n"
-                    chunk_size = 60
-                    for i in range(0, len(content), chunk_size):
-                        yield f"data: {json.dumps({'type':'code_chunk','text':content[i:i+chunk_size]})}\n\n"
-                    yield f"data: {json.dumps({'type':'code_end'})}\n\n"
-                    result = do_write(filename, content)
-                    import re as _re
-                    m = _re.search(r'(\d[\d,]+) bytes', result)
-                    sz = int(m.group(1).replace(',','')) if m else 0
-                    yield f"data: {json.dumps({'type':'tool_result','tool_name':tu.name,'text':f'✓ Written {sz:,} bytes'})}\n\n"
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
-                else:
-                    yield f"data: {json.dumps({'type':'tool_start','tool_name':tu.name})}\n\n"
-                    result = run_tool(tu.name, inp)
-                    yield f"data: {json.dumps({'type':'tool_result','tool_name':tu.name,'text':result})}\n\n"
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
+                result = run_tool(tu.name, tu.input)
+                yield f"data: {json.dumps({'type':'tool','name':tu.name,'result':result})}\n\n"
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
 
             if tool_results:
                 msgs.append({"role": "user", "content": tool_results})
